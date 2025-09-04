@@ -7,8 +7,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 import os
+import google.generativeai as genai
 
-# --- Bagian 1: Inisialisasi Firebase ---
+# --- Bagian 1: Inisialisasi Firebase dan Gemini API ---
 def initialize_firebase():
     """Menginisialisasi Firebase Admin SDK."""
     try:
@@ -35,8 +36,23 @@ def initialize_firebase():
 
 db, firebase_initialized = initialize_firebase()
 
-# --- Bagian 2: Definisi Data dan Fungsi Bantuan ---
+def initialize_gemini():
+    """Menginisialisasi Gemini API."""
+    try:
+        if "gemini_api_key" in st.secrets:
+            genai.configure(api_key=st.secrets["gemini_api_key"])
+            return True
+        else:
+            st.error("Gemini API key not found. Please add 'gemini_api_key' to Streamlit secrets.")
+            return False
+    except Exception as e:
+        st.error(f"Error initializing Gemini API: {e}")
+        return False
 
+gemini_initialized = initialize_gemini()
+chat_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# --- Bagian 2: Definisi Data dan Fungsi Bantuan ---
 # Fungsi untuk mengonversi DMS ke Derajat Desimal (DD)
 def dms_to_dd(dms_str):
     """Mengonversi string DMS menjadi derajat desimal."""
@@ -196,81 +212,67 @@ with tab2:
 
         with st.chat_message("assistant"):
             with st.spinner("Memproses..."):
-                # Logika ekstraksi dari prompt
-                # Ini adalah simulasi dari respons Gemini API.
-                # Dalam implementasi nyata, Anda akan mengirim prompt ke Gemini API
-                # dan memproses respons yang diterima.
-                match = re.search(r"konversi\s+([-+]?\d+\.?\d*|[-+]?\d+°\s*\d+'\s*\d+\.?\d*\"?\s*[NSEW]?)\s*,\s*([-+]?\d+\.?\d*|[-+]?\d+°\s*\d+'\s*\d+\.?\d*\"?\s*[NSEW]?)\s*(?:dari\s+([\w\s\/]+))?\s*ke\s+([\w\s\/]+)", prompt, re.IGNORECASE)
-                
-                if match:
-                    x_input, y_input, source_cs_name, target_cs_name = match.groups()
-                    
-                    # Logika penentuan format dan CRS
-                    source_format = "DD"
-                    if "°" in x_input:
-                        source_format = "DMS"
-                    
-                    # Asumsi default jika tidak ada CRS sumber yang disebutkan
-                    source_crs = "EPSG:4326" # WGS 84
-                    if source_cs_name and "ITRF" in source_cs_name:
-                        source_crs = "EPSG:7912"
-                    
-                    # Penentuan CRS target
-                    target_crs = None
-                    if "UTM 48N" in target_cs_name: target_crs = "EPSG:32648"
-                    elif "UTM 49N" in target_cs_name: target_crs = "EPSG:32649"
-                    elif "UTM 50N" in target_cs_name: target_crs = "EPSG:32650"
-                    elif "UTM 48S" in target_cs_name: target_crs = "EPSG:32748"
-                    elif "WGS 84" in target_cs_name: target_crs = "EPSG:4326"
-                    elif "ITRF" in target_cs_name: target_crs = "EPSG:7912"
-                    
-                    if target_crs:
-                        x_converted, y_converted = convert_coordinates(x_input, y_input, source_crs, target_crs, source_format)
+                if not gemini_initialized:
+                    st.warning("Gemini API tidak dapat diinisialisasi. Fitur chatbot tidak aktif.")
+                else:
+                    try:
+                        # Minta Gemini untuk mengekstrak informasi yang dibutuhkan
+                        response = chat_model.generate_content(
+                            f"Identifikasi dan ekstrak koordinat, format asal (DD, DMS, atau UTM), dan format target (DD, DMS, atau UTM) dari teks berikut. Balas dalam format JSON. Jika CRS target adalah UTM, sertakan zona (misalnya, 'UTM Zona 49N'). Jika tidak dapat diekstrak, beri tahu saya. Teks: '{prompt}'"
+                        )
+                        data = json.loads(response.text.replace('```json\n', '').replace('\n```', ''))
 
-                        if x_converted is not None:
-                            # Penentuan format output
-                            target_format_out = "DD"
-                            if "°" not in str(x_converted) and "UTM" in target_cs_name:
-                                target_format_out = "UTM"
-                            elif "°" not in str(x_converted) and "WGS" in target_cs_name:
-                                target_format_out = "DD"
+                        x_input = data.get('x_coord')
+                        y_input = data.get('y_coord')
+                        source_format = data.get('source_format')
+                        target_format = data.get('target_format')
+                        target_cs_name = data.get('target_cs_name')
+
+                        if x_input and y_input and source_format and target_format:
+                            # Tentukan CRS dari nama yang diekstrak oleh Gemini
+                            source_crs = "EPSG:4326"
+                            target_crs = "EPSG:4326"
+                            if "UTM" in target_cs_name:
+                                if "48N" in target_cs_name: target_crs = "EPSG:32648"
+                                elif "49N" in target_cs_name: target_crs = "EPSG:32649"
+                                elif "50N" in target_cs_name: target_crs = "EPSG:32650"
+                                elif "48S" in target_cs_name: target_crs = "EPSG:32748"
                             
-                            # Mengonversi format output jika perlu
-                            if target_format_out == "DMS":
-                                x_out, y_out = dd_to_dms(x_converted, is_lon=True), dd_to_dms(y_converted)
-                            else:
+                            x_converted, y_converted = convert_coordinates(x_input, y_input, source_crs, target_crs, source_format)
+
+                            if x_converted is not None:
                                 x_out, y_out = x_converted, y_converted
+                                if target_format == 'DMS':
+                                    x_out, y_out = dd_to_dms(x_converted, is_lon=True), dd_to_dms(y_converted)
 
-                            response_text = f"Tentu, koordinat hasil konversi Anda adalah: `{x_out}, {y_out}`."
-                            st.markdown(response_text)
-                            st.session_state.messages.append({"role": "assistant", "content": response_text})
+                                response_text = f"Tentu, koordinat hasil konversi Anda adalah: `{x_out}, {y_out}`."
+                                st.markdown(response_text)
+                                st.session_state.messages.append({"role": "assistant", "content": response_text})
 
-                            # Simpan ke Firestore
-                            if firebase_initialized:
-                                try:
-                                    doc_ref = db.collection('konversi').document()
-                                    doc_ref.set({
-                                        'user_query': prompt,
-                                        'original_coords': f"{x_input}, {y_input}",
-                                        'converted_coords': f"{x_out}, {y_out}",
-                                        'timestamp': datetime.utcnow(),
-                                        'source_crs': coordinate_systems[source_category][source_cs_name] if source_cs_name else source_crs,
-                                        'target_crs': target_crs
-                                    })
-                                    st.toast("✅ Konversi disimpan ke database!")
-                                except Exception as e:
-                                    st.error(f"Gagal menyimpan ke database: {e}")
-                            
+                                # Simpan ke Firestore
+                                if firebase_initialized:
+                                    try:
+                                        doc_ref = db.collection('konversi_chatbot').document()
+                                        doc_ref.set({
+                                            'user_query': prompt,
+                                            'original_coords': f"{x_input}, {y_input}",
+                                            'converted_coords': f"{x_out}, {y_out}",
+                                            'timestamp': datetime.utcnow(),
+                                            'source_crs': source_crs,
+                                            'target_crs': target_crs
+                                        })
+                                        st.toast("✅ Konversi disimpan ke database!")
+                                    except Exception as e:
+                                        st.error(f"Gagal menyimpan ke database: {e}")
+                            else:
+                                response_text = "Maaf, saya tidak dapat melakukan konversi dengan format tersebut. Bisakah Anda coba lagi?"
+                                st.markdown(response_text)
+                                st.session_state.messages.append({"role": "assistant", "content": response_text})
                         else:
-                            response_text = "Maaf, saya tidak dapat melakukan konversi dengan format tersebut. Bisakah Anda coba lagi?"
+                            response_text = "Maaf, saya tidak memahami permintaan Anda. Mohon gunakan format seperti 'konversi [koordinat X], [koordinat Y] ke [CRS target]'."
                             st.markdown(response_text)
                             st.session_state.messages.append({"role": "assistant", "content": response_text})
-                    else:
-                        response_text = "Maaf, sistem koordinat target tidak dikenali."
+                    except Exception as e:
+                        response_text = f"Terjadi kesalahan saat memproses permintaan: {e}. Mohon coba lagi."
                         st.markdown(response_text)
                         st.session_state.messages.append({"role": "assistant", "content": response_text})
-
-                else:
-                    response_text = "Maaf, saya tidak memahami permintaan Anda. Mohon gunakan format seperti 'konversi [koordinat X], [koordinat Y] ke [CRS target]'."
-                    st.markdown(response_text)
-                    st.session_state.messages.append({"role": "assistant", "content": response_text})
