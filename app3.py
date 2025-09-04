@@ -1,41 +1,12 @@
 import streamlit as st
-import pandas as pd
 import pyproj
 import re
 import json
-import firebase_admin
-from firebase_admin import credentials, firestore
-from datetime import datetime
 import os
 import google.generativeai as genai
+from datetime import datetime
 
-# --- Bagian 1: Inisialisasi Firebase dan Gemini API ---
-def initialize_firebase():
-    """Menginisialisasi Firebase Admin SDK."""
-    try:
-        # Untuk deployment Streamlit, gunakan secret yang didefinisikan
-        if "FIREBASE_CREDENTIALS" in st.secrets:
-            creds_json = st.secrets["FIREBASE_CREDENTIALS"]
-            creds_dict = json.loads(creds_json)
-            cred = credentials.Certificate(creds_dict)
-        # Untuk pengembangan lokal, gunakan file JSON
-        elif os.path.exists("firebase_credentials.json"):
-            cred = credentials.Certificate("firebase_credentials.json")
-        else:
-            st.error("Firebase credentials not found. Please add 'firebase_credentials.json' or set it in Streamlit secrets.")
-            return None, None
-
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        
-        db = firestore.client()
-        return db, True
-    except Exception as e:
-        st.error(f"Error initializing Firebase: {e}")
-        return None, False
-
-db, firebase_initialized = initialize_firebase()
-
+# --- Bagian 1: Inisialisasi Gemini API ---
 def initialize_gemini():
     """Menginisialisasi Gemini API."""
     try:
@@ -52,7 +23,25 @@ def initialize_gemini():
 gemini_initialized = initialize_gemini()
 chat_model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- Bagian 2: Definisi Data dan Fungsi Bantuan ---
+# --- Bagian 2: Fungsi untuk Database File-based ---
+HISTORY_FILE = "konversi_history.json"
+
+def load_history():
+    """Memuat riwayat konversi dari file JSON."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def save_history(history):
+    """Menyimpan riwayat konversi ke file JSON."""
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=4)
+
+# --- Bagian 3: Definisi Data dan Fungsi Bantuan ---
 # Fungsi untuk mengonversi DMS ke Derajat Desimal (DD)
 def dms_to_dd(dms_str):
     """Mengonversi string DMS menjadi derajat desimal."""
@@ -134,7 +123,7 @@ coordinate_systems = {
 
 formats = ["DD", "DMS", "UTM"]
 
-# --- Bagian 3: Antarmuka Streamlit ---
+# --- Bagian 4: Antarmuka Streamlit ---
 st.set_page_config(page_title="Konverter Koordinat Spasial Lengkap", layout="wide")
 st.title("🗺️ Konverter Koordinat Spasial Lengkap")
 
@@ -177,7 +166,6 @@ with tab1:
             x_converted, y_converted = convert_coordinates(x_input, y_input, source_crs, target_crs, source_format)
             
             if x_converted is not None:
-                # Mengembalikan output sesuai format target
                 if target_format == 'DD':
                     x_out, y_out = x_converted, y_converted
                 elif target_format == 'DMS':
@@ -197,14 +185,12 @@ with tab2:
     st.write("Silakan ketik permintaan konversi Anda. Contoh: 'konversi -6.9248, 107.6186 ke UTM' atau 'konversi 6° 55' 38.87\" S, 107° 38' 11.23\" E ke UTM 49N'.")
 
     if "messages" not in st.session_state:
-        st.session_state.messages = []
+        st.session_state.messages = load_history()
 
-    # Tampilkan riwayat percakapan
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Tangani input pengguna baru
     if prompt := st.chat_input("Apa yang ingin Anda konversi?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -216,7 +202,6 @@ with tab2:
                     st.warning("Gemini API tidak dapat diinisialisasi. Fitur chatbot tidak aktif.")
                 else:
                     try:
-                        # Minta Gemini untuk mengekstrak informasi yang dibutuhkan
                         response = chat_model.generate_content(
                             f"Identifikasi dan ekstrak koordinat, format asal (DD, DMS, atau UTM), dan format target (DD, DMS, atau UTM) dari teks berikut. Balas dalam format JSON. Jika CRS target adalah UTM, sertakan zona (misalnya, 'UTM Zona 49N'). Jika tidak dapat diekstrak, beri tahu saya. Teks: '{prompt}'"
                         )
@@ -229,7 +214,6 @@ with tab2:
                         target_cs_name = data.get('target_cs_name')
 
                         if x_input and y_input and source_format and target_format:
-                            # Tentukan CRS dari nama yang diekstrak oleh Gemini
                             source_crs = "EPSG:4326"
                             target_crs = "EPSG:4326"
                             if "UTM" in target_cs_name:
@@ -248,22 +232,8 @@ with tab2:
                                 response_text = f"Tentu, koordinat hasil konversi Anda adalah: `{x_out}, {y_out}`."
                                 st.markdown(response_text)
                                 st.session_state.messages.append({"role": "assistant", "content": response_text})
-
-                                # Simpan ke Firestore
-                                if firebase_initialized:
-                                    try:
-                                        doc_ref = db.collection('konversi_chatbot').document()
-                                        doc_ref.set({
-                                            'user_query': prompt,
-                                            'original_coords': f"{x_input}, {y_input}",
-                                            'converted_coords': f"{x_out}, {y_out}",
-                                            'timestamp': datetime.utcnow(),
-                                            'source_crs': source_crs,
-                                            'target_crs': target_crs
-                                        })
-                                        st.toast("✅ Konversi disimpan ke database!")
-                                    except Exception as e:
-                                        st.error(f"Gagal menyimpan ke database: {e}")
+                                save_history(st.session_state.messages)
+                                st.toast("✅ Konversi disimpan ke riwayat!")
                             else:
                                 response_text = "Maaf, saya tidak dapat melakukan konversi dengan format tersebut. Bisakah Anda coba lagi?"
                                 st.markdown(response_text)
