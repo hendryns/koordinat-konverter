@@ -2,3 +2,4 @@ streamlit
 pandas
 pyproj
 google-generativeai
+firebase-admin
